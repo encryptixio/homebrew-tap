@@ -1,0 +1,134 @@
+name: Build and Release enx
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g., 0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: enx-darwin-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: enx-darwin-amd64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: enx-linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: enx-linux-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v4
+        with:
+          repository: encryptixio/backend
+          token: ${{ secrets.BACKEND_PAT }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build -p enx --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cp target/${{ matrix.target }}/release/enx ${{ matrix.artifact }}
+          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "enx-v${{ inputs.version }}" \
+            --title "enx v${{ inputs.version }}" \
+            --generate-notes \
+            artifacts/*.tar.gz artifacts/*.sha256
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          DA64=$(awk '{print $1}' artifacts/enx-darwin-arm64.tar.gz.sha256)
+          DX64=$(awk '{print $1}' artifacts/enx-darwin-amd64.tar.gz.sha256)
+          LA64=$(awk '{print $1}' artifacts/enx-linux-arm64.tar.gz.sha256)
+          LX64=$(awk '{print $1}' artifacts/enx-linux-amd64.tar.gz.sha256)
+          BASE="https://github.com/encryptixio/homebrew-tap/releases/download/enx-v${VERSION}"
+
+          printf '%s\n' \
+            'class Enx < Formula' \
+            '  desc "Encryptix CLI - SSH into IoT devices and manage your fleet"' \
+            '  homepage "https://encryptix.io"' \
+            "  version \"${VERSION}\"" \
+            '  license "MIT"' \
+            '' \
+            '  on_macos do' \
+            '    if Hardware::CPU.arm?' \
+            "      url \"${BASE}/enx-darwin-arm64.tar.gz\"" \
+            "      sha256 \"${DA64}\"" \
+            '    else' \
+            "      url \"${BASE}/enx-darwin-amd64.tar.gz\"" \
+            "      sha256 \"${DX64}\"" \
+            '    end' \
+            '  end' \
+            '' \
+            '  on_linux do' \
+            '    if Hardware::CPU.arm?' \
+            "      url \"${BASE}/enx-linux-arm64.tar.gz\"" \
+            "      sha256 \"${LA64}\"" \
+            '    else' \
+            "      url \"${BASE}/enx-linux-amd64.tar.gz\"" \
+            "      sha256 \"${LX64}\"" \
+            '    end' \
+            '  end' \
+            '' \
+            '  def install' \
+            '    bin.install Dir["enx-*"].first => "enx"' \
+            '  end' \
+            '' \
+            '  test do' \
+            '    assert_match "enx", shell_output("#{bin}/enx version")' \
+            '  end' \
+            'end' > Formula/enx.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/enx.rb
+          git commit -m "Update enx formula to v${VERSION}"
+          git push
